@@ -244,9 +244,15 @@ func RecipeVsSnapshot(rec *recipe.RecipeResult, snap *snapshotter.Snapshot) *Res
 	// 2. Check component drift (version and presence from componentRefs)
 	result.ComponentDrifts = checkComponentDrift(rec, snap)
 	for _, cd := range result.ComponentDrifts {
-		if cd.Status == "ok" {
+		switch cd.Status {
+		case "ok":
 			result.Summary.ComponentsOK++
-		} else {
+		case "version-mismatch":
+			result.Summary.ComponentsDrifted++
+		default:
+			// "not-observed" — component image not found in snapshot.
+			// This is informational, not definitive drift (pod may not have
+			// been running during snapshot collection).
 			result.Summary.ComponentsDrifted++
 		}
 	}
@@ -259,13 +265,14 @@ func RecipeVsSnapshot(rec *recipe.RecipeResult, snap *snapshotter.Snapshot) *Res
 	return result
 }
 
-// checkComponentDrift compares recipe componentRefs against snapshot Helm releases.
-// The K8s collector captures deployed Helm releases in K8s.helm.* readings.
+// checkComponentDrift compares recipe componentRefs against snapshot container images.
+// The K8s collector captures deployed container images in K8s.image (image name → tag).
+// Component names are matched against image names using the chart name or component name.
 func checkComponentDrift(rec *recipe.RecipeResult, snap *snapshotter.Snapshot) []ComponentDrift {
 	drifts := make([]ComponentDrift, 0, len(rec.ComponentRefs))
 
-	// Build index of deployed Helm releases from snapshot
-	deployedVersions := extractHelmReleases(snap)
+	// Build index of deployed container images from snapshot (K8s.image subtype)
+	deployedImages := extractContainerImages(snap)
 
 	for _, ref := range rec.ComponentRefs {
 		if !ref.IsEnabled() {
@@ -278,20 +285,19 @@ func checkComponentDrift(rec *recipe.RecipeResult, snap *snapshotter.Snapshot) [
 			Namespace:       ref.Namespace,
 		}
 
-		actualVersion, found := deployedVersions[ref.Name]
-		if !found {
-			// Also try chart name (some releases use chart name, not component name)
-			if ref.Chart != "" {
-				actualVersion, found = deployedVersions[ref.Chart]
-			}
+		// Try to find the component's container image in the snapshot.
+		// Match by component name or chart name against image names.
+		actualVersion, found := deployedImages[ref.Name]
+		if !found && ref.Chart != "" {
+			actualVersion, found = deployedImages[ref.Chart]
 		}
 
 		if !found {
-			cd.Status = "missing"
+			cd.Status = "not-observed"
 			cd.ActualVersion = ""
 		} else {
 			cd.ActualVersion = actualVersion
-			if ref.Version != "" && actualVersion != ref.Version {
+			if ref.Version != "" && actualVersion != "" && actualVersion != ref.Version {
 				cd.Status = "version-mismatch"
 			} else {
 				cd.Status = "ok"
@@ -308,24 +314,28 @@ func checkComponentDrift(rec *recipe.RecipeResult, snap *snapshotter.Snapshot) [
 	return drifts
 }
 
-// extractHelmReleases builds a map of release-name → version from snapshot's K8s.helm subtype.
-func extractHelmReleases(snap *snapshotter.Snapshot) map[string]string {
-	releases := make(map[string]string)
+// extractContainerImages builds a map of image-name → tag from snapshot's K8s.image subtype.
+// The K8s collector strips registry prefixes and splits name:tag, so entries look like:
+//
+//	"gpu-operator": "v24.9.0"
+//	"cert-manager-controller": "v1.14.0"
+func extractContainerImages(snap *snapshotter.Snapshot) map[string]string {
+	images := make(map[string]string)
 
 	for _, m := range snap.Measurements {
 		if m.Type != measurement.TypeK8s {
 			continue
 		}
-		st := m.GetSubtype("helm")
+		st := m.GetSubtype("image")
 		if st == nil {
 			continue
 		}
 		for key, reading := range st.Data {
-			releases[key] = reading.String()
+			images[key] = reading.String()
 		}
 	}
 
-	return releases
+	return images
 }
 
 // checkValidationPhases summarizes validation phase config and evaluates phase-level constraints.

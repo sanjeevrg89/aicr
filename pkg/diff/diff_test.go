@@ -352,7 +352,7 @@ func TestRecipeVsSnapshot_ComponentPresent(t *testing.T) {
 
 	snap := makeSnapshot(
 		makeMeasurement(measurement.TypeK8s,
-			makeSubtype("helm", map[string]measurement.Reading{
+			makeSubtype("image", map[string]measurement.Reading{
 				"gpu-operator": measurement.Str("24.9.0"),
 			}),
 		),
@@ -377,7 +377,7 @@ func TestRecipeVsSnapshot_ComponentMissing(t *testing.T) {
 
 	snap := makeSnapshot(
 		makeMeasurement(measurement.TypeK8s,
-			makeSubtype("helm", map[string]measurement.Reading{
+			makeSubtype("image", map[string]measurement.Reading{
 				"cert-manager": measurement.Str("1.14.0"),
 			}),
 		),
@@ -388,7 +388,7 @@ func TestRecipeVsSnapshot_ComponentMissing(t *testing.T) {
 	if result.Summary.ComponentsDrifted != 1 {
 		t.Errorf("expected 1 component drifted, got %d", result.Summary.ComponentsDrifted)
 	}
-	if result.ComponentDrifts[0].Status != "missing" {
+	if result.ComponentDrifts[0].Status != "not-observed" {
 		t.Errorf("expected status missing, got %s", result.ComponentDrifts[0].Status)
 	}
 	if !result.HasDrift() {
@@ -405,7 +405,7 @@ func TestRecipeVsSnapshot_ComponentVersionMismatch(t *testing.T) {
 
 	snap := makeSnapshot(
 		makeMeasurement(measurement.TypeK8s,
-			makeSubtype("helm", map[string]measurement.Reading{
+			makeSubtype("image", map[string]measurement.Reading{
 				"gpu-operator": measurement.Str("24.6.0"),
 			}),
 		),
