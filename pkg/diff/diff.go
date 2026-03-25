@@ -16,8 +16,8 @@
 // constraints to detect configuration drift. It supports two modes:
 //
 //   - Snapshot-vs-snapshot: raw field-level comparison between two states.
-//   - Recipe-vs-snapshot: evaluate recipe constraints against a snapshot to
-//     detect drift from the recipe-defined desired state.
+//   - Recipe-vs-snapshot: evaluate recipe constraints and component versions
+//     against a snapshot to detect drift from the recipe-defined desired state.
 package diff
 
 import (
@@ -53,7 +53,7 @@ const (
 	SeverityError Severity = "error"
 )
 
-// Change represents a single difference between two snapshots.
+// Change represents a single field-level difference between two snapshots.
 type Change struct {
 	// Kind is the type of change (added, removed, modified).
 	Kind ChangeKind `json:"kind" yaml:"kind"`
@@ -85,6 +85,30 @@ type ConstraintResult struct {
 	Error string `json:"error,omitempty" yaml:"error,omitempty"`
 }
 
+// ComponentDrift represents drift in a recipe component's version or presence.
+type ComponentDrift struct {
+	// Name is the component name (e.g., "gpu-operator").
+	Name string `json:"name" yaml:"name"`
+	// ExpectedVersion is the version from the recipe.
+	ExpectedVersion string `json:"expectedVersion,omitempty" yaml:"expectedVersion,omitempty"`
+	// ActualVersion is the version found in the snapshot (empty if not found).
+	ActualVersion string `json:"actualVersion,omitempty" yaml:"actualVersion,omitempty"`
+	// Namespace is the expected deployment namespace.
+	Namespace string `json:"namespace,omitempty" yaml:"namespace,omitempty"`
+	// Status describes the drift (e.g., "missing", "version-mismatch", "ok").
+	Status string `json:"status" yaml:"status"`
+}
+
+// ValidationPhaseSummary summarizes drift in a validation phase's configuration.
+type ValidationPhaseSummary struct {
+	// Phase name (deployment, performance, conformance).
+	Phase string `json:"phase" yaml:"phase"`
+	// Checks listed in the recipe for this phase.
+	Checks []string `json:"checks" yaml:"checks"`
+	// Constraints for this phase, if any.
+	ConstraintResults []ConstraintResult `json:"constraintResults,omitempty" yaml:"constraintResults,omitempty"`
+}
+
 // Result contains the complete diff output.
 type Result struct {
 	// Mode describes the comparison mode ("snapshot-vs-snapshot" or "recipe-vs-snapshot").
@@ -95,8 +119,12 @@ type Result struct {
 	TargetSource string `json:"targetSource,omitempty" yaml:"targetSource,omitempty"`
 	// Changes is the list of field-level differences (snapshot-vs-snapshot mode).
 	Changes []Change `json:"changes,omitempty" yaml:"changes,omitempty"`
-	// ConstraintResults is the list of constraint evaluations (recipe-vs-snapshot mode).
+	// ConstraintResults is the list of top-level constraint evaluations (recipe-vs-snapshot mode).
 	ConstraintResults []ConstraintResult `json:"constraintResults,omitempty" yaml:"constraintResults,omitempty"`
+	// ComponentDrifts reports per-component drift (recipe-vs-snapshot mode).
+	ComponentDrifts []ComponentDrift `json:"componentDrifts,omitempty" yaml:"componentDrifts,omitempty"`
+	// ValidationPhases reports per-phase constraint and check status (recipe-vs-snapshot mode).
+	ValidationPhases []ValidationPhaseSummary `json:"validationPhases,omitempty" yaml:"validationPhases,omitempty"`
 	// Summary contains aggregate counts.
 	Summary Summary `json:"summary" yaml:"summary"`
 }
@@ -111,12 +139,15 @@ type Summary struct {
 	ConstraintsPassed int `json:"constraintsPassed,omitempty" yaml:"constraintsPassed,omitempty"`
 	ConstraintsFailed int `json:"constraintsFailed,omitempty" yaml:"constraintsFailed,omitempty"`
 	ConstraintsError  int `json:"constraintsError,omitempty" yaml:"constraintsError,omitempty"`
+	// Component-specific counts (recipe-vs-snapshot mode).
+	ComponentsOK      int `json:"componentsOk,omitempty" yaml:"componentsOk,omitempty"`
+	ComponentsDrifted int `json:"componentsDrifted,omitempty" yaml:"componentsDrifted,omitempty"`
 }
 
 // HasDrift returns true if any field-level changes or constraint violations were detected.
 func (r *Result) HasDrift() bool {
 	if r.Mode == "recipe-vs-snapshot" {
-		return r.Summary.ConstraintsFailed > 0 || r.Summary.ConstraintsError > 0
+		return r.Summary.ConstraintsFailed > 0 || r.Summary.ConstraintsError > 0 || r.Summary.ComponentsDrifted > 0
 	}
 	return r.Summary.Total > 0
 }
@@ -181,15 +212,18 @@ func Snapshots(baseline, target *snapshotter.Snapshot) *Result {
 	return result
 }
 
-// RecipeVsSnapshot evaluates a recipe's constraints against a snapshot to detect
-// drift from the recipe-defined desired state. This is the primary drift detection
-// mode — it answers "does this cluster still match what the recipe requires?"
+// RecipeVsSnapshot evaluates a recipe's constraints and components against a snapshot
+// to detect drift from the recipe-defined desired state. This uses the same constraint
+// evaluation path as `aicr validate --readiness` (pkg/constraints.Evaluate).
 func RecipeVsSnapshot(rec *recipe.RecipeResult, snap *snapshotter.Snapshot) *Result {
 	result := &Result{
 		Mode:              "recipe-vs-snapshot",
 		ConstraintResults: make([]ConstraintResult, 0, len(rec.Constraints)),
+		ComponentDrifts:   make([]ComponentDrift, 0),
+		ValidationPhases:  make([]ValidationPhaseSummary, 0),
 	}
 
+	// 1. Evaluate top-level constraints (same path as validator.checkReadiness)
 	for _, constraint := range rec.Constraints {
 		cr := evaluateConstraint(constraint, snap)
 		result.ConstraintResults = append(result.ConstraintResults, cr)
@@ -203,17 +237,141 @@ func RecipeVsSnapshot(rec *recipe.RecipeResult, snap *snapshotter.Snapshot) *Res
 		}
 	}
 
-	// Sort by name for deterministic output
 	sort.Slice(result.ConstraintResults, func(i, j int) bool {
 		return result.ConstraintResults[i].Name < result.ConstraintResults[j].Name
 	})
+
+	// 2. Check component drift (version and presence from componentRefs)
+	result.ComponentDrifts = checkComponentDrift(rec, snap)
+	for _, cd := range result.ComponentDrifts {
+		if cd.Status == "ok" {
+			result.Summary.ComponentsOK++
+		} else {
+			result.Summary.ComponentsDrifted++
+		}
+	}
+
+	// 3. Summarize validation phase configuration
+	result.ValidationPhases = checkValidationPhases(rec, snap)
 
 	result.Summary.Total = len(result.ConstraintResults)
 
 	return result
 }
 
+// checkComponentDrift compares recipe componentRefs against snapshot Helm releases.
+// The K8s collector captures deployed Helm releases in K8s.helm.* readings.
+func checkComponentDrift(rec *recipe.RecipeResult, snap *snapshotter.Snapshot) []ComponentDrift {
+	drifts := make([]ComponentDrift, 0, len(rec.ComponentRefs))
+
+	// Build index of deployed Helm releases from snapshot
+	deployedVersions := extractHelmReleases(snap)
+
+	for _, ref := range rec.ComponentRefs {
+		if !ref.IsEnabled() {
+			continue
+		}
+
+		cd := ComponentDrift{
+			Name:            ref.Name,
+			ExpectedVersion: ref.Version,
+			Namespace:       ref.Namespace,
+		}
+
+		actualVersion, found := deployedVersions[ref.Name]
+		if !found {
+			// Also try chart name (some releases use chart name, not component name)
+			if ref.Chart != "" {
+				actualVersion, found = deployedVersions[ref.Chart]
+			}
+		}
+
+		if !found {
+			cd.Status = "missing"
+			cd.ActualVersion = ""
+		} else {
+			cd.ActualVersion = actualVersion
+			if ref.Version != "" && actualVersion != ref.Version {
+				cd.Status = "version-mismatch"
+			} else {
+				cd.Status = "ok"
+			}
+		}
+
+		drifts = append(drifts, cd)
+	}
+
+	sort.Slice(drifts, func(i, j int) bool {
+		return drifts[i].Name < drifts[j].Name
+	})
+
+	return drifts
+}
+
+// extractHelmReleases builds a map of release-name → version from snapshot's K8s.helm subtype.
+func extractHelmReleases(snap *snapshotter.Snapshot) map[string]string {
+	releases := make(map[string]string)
+
+	for _, m := range snap.Measurements {
+		if m.Type != measurement.TypeK8s {
+			continue
+		}
+		st := m.GetSubtype("helm")
+		if st == nil {
+			continue
+		}
+		for key, reading := range st.Data {
+			releases[key] = reading.String()
+		}
+	}
+
+	return releases
+}
+
+// checkValidationPhases summarizes validation phase config and evaluates phase-level constraints.
+func checkValidationPhases(rec *recipe.RecipeResult, snap *snapshotter.Snapshot) []ValidationPhaseSummary {
+	if rec.Validation == nil {
+		return nil
+	}
+
+	phases := make([]ValidationPhaseSummary, 0, 3)
+
+	type phaseInfo struct {
+		name  string
+		phase *recipe.ValidationPhase
+	}
+
+	for _, p := range []phaseInfo{
+		{"deployment", rec.Validation.Deployment},
+		{"performance", rec.Validation.Performance},
+		{"conformance", rec.Validation.Conformance},
+	} {
+		if p.phase == nil {
+			continue
+		}
+
+		summary := ValidationPhaseSummary{
+			Phase:  p.name,
+			Checks: p.phase.Checks,
+		}
+
+		// Evaluate phase-level constraints if any
+		if len(p.phase.Constraints) > 0 {
+			summary.ConstraintResults = make([]ConstraintResult, 0, len(p.phase.Constraints))
+			for _, c := range p.phase.Constraints {
+				cr := evaluateConstraint(c, snap)
+				summary.ConstraintResults = append(summary.ConstraintResults, cr)
+			}
+		}
+
+		phases = append(phases, summary)
+	}
+
+	return phases
+}
+
 // evaluateConstraint evaluates a single recipe constraint against a snapshot.
+// Uses the same constraints.Evaluate path as validator.checkReadiness.
 func evaluateConstraint(c recipe.Constraint, snap *snapshotter.Snapshot) ConstraintResult {
 	cr := ConstraintResult{
 		Name:        c.Name,
@@ -221,7 +379,6 @@ func evaluateConstraint(c recipe.Constraint, snap *snapshotter.Snapshot) Constra
 		Remediation: c.Remediation,
 	}
 
-	// Map recipe severity to diff severity
 	switch c.Severity {
 	case "warning":
 		cr.Severity = SeverityWarning
@@ -314,8 +471,7 @@ func compareReadings(prefix string, base, target map[string]measurement.Reading)
 func addedMeasurement(m *measurement.Measurement) []Change {
 	var changes []Change
 	for _, st := range m.Subtypes {
-		prefix := string(m.Type) + "." + st.Name
-		changes = append(changes, addedSubtype(prefix, &st)...)
+		changes = append(changes, addedSubtype(string(m.Type)+"."+st.Name, &st)...)
 	}
 	return changes
 }
@@ -323,8 +479,7 @@ func addedMeasurement(m *measurement.Measurement) []Change {
 func removedMeasurement(m *measurement.Measurement) []Change {
 	var changes []Change
 	for _, st := range m.Subtypes {
-		prefix := string(m.Type) + "." + st.Name
-		changes = append(changes, removedSubtype(prefix, &st)...)
+		changes = append(changes, removedSubtype(string(m.Type)+"."+st.Name, &st)...)
 	}
 	return changes
 }

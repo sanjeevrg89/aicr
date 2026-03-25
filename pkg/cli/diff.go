@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 
 	"github.com/urfave/cli/v3"
 
@@ -38,8 +39,9 @@ func diffCmd() *cli.Command {
 
   Recipe mode (--recipe + --snapshot):
     Evaluate recipe constraints against a snapshot to determine if the
-    cluster still meets the recipe's requirements. Reports pass/fail
-    per constraint with severity and remediation guidance.
+    cluster still meets the recipe's requirements. Checks top-level
+    constraints, component versions, and validation phase configuration.
+    Reports pass/fail per constraint with severity and remediation.
 
   Snapshot mode (--baseline + --target):
     Compare two snapshots field-by-field to see what changed.
@@ -48,7 +50,10 @@ Examples:
   # Check if cluster matches recipe requirements (primary use case)
   aicr diff --recipe recipe.yaml --snapshot current.yaml
 
-  # Same with JSON output for CI/CD pipelines
+  # Human-readable table output
+  aicr diff --recipe recipe.yaml --snapshot current.yaml --format table
+
+  # JSON output for CI/CD pipelines with non-zero exit on drift
   aicr diff --recipe recipe.yaml --snapshot current.yaml --format json --fail-on-drift
 
   # Compare two snapshots to see what changed
@@ -122,7 +127,6 @@ func runDiffCmd(ctx context.Context, cmd *cli.Command) error {
 	baselinePath := cmd.String("baseline")
 	targetPath := cmd.String("target")
 
-	// Determine mode
 	hasRecipeMode := recipePath != "" || snapshotPath != ""
 	hasSnapshotMode := baselinePath != "" || targetPath != ""
 
@@ -177,16 +181,18 @@ func runRecipeDiff(ctx context.Context, cmd *cli.Command, recipePath, snapshotPa
 	slog.Info("recipe diff complete",
 		slog.Int("passed", result.Summary.ConstraintsPassed),
 		slog.Int("failed", result.Summary.ConstraintsFailed),
-		slog.Int("errors", result.Summary.ConstraintsError))
+		slog.Int("errors", result.Summary.ConstraintsError),
+		slog.Int("componentsOk", result.Summary.ComponentsOK),
+		slog.Int("componentsDrifted", result.Summary.ComponentsDrifted))
 
-	if err := writeResult(ctx, cmd, outFormat, result); err != nil {
+	if err := writeDiffResult(ctx, cmd, outFormat, result); err != nil {
 		return err
 	}
 
 	if cmd.Bool("fail-on-drift") && result.HasDrift() {
 		return errors.New(errors.ErrCodeInvalidRequest,
-			fmt.Sprintf("drift detected: %d constraint(s) failed, %d error(s)",
-				result.Summary.ConstraintsFailed, result.Summary.ConstraintsError))
+			fmt.Sprintf("drift detected: %d constraint(s) failed, %d component(s) drifted",
+				result.Summary.ConstraintsFailed, result.Summary.ComponentsDrifted))
 	}
 
 	return nil
@@ -224,7 +230,7 @@ func runSnapshotDiff(ctx context.Context, cmd *cli.Command, baselinePath, target
 		slog.Int("removed", result.Summary.Removed),
 		slog.Int("modified", result.Summary.Modified))
 
-	if err := writeResult(ctx, cmd, outFormat, result); err != nil {
+	if err := writeDiffResult(ctx, cmd, outFormat, result); err != nil {
 		return err
 	}
 
@@ -236,9 +242,26 @@ func runSnapshotDiff(ctx context.Context, cmd *cli.Command, baselinePath, target
 	return nil
 }
 
-// writeResult serializes the diff result to the configured output.
-func writeResult(ctx context.Context, cmd *cli.Command, outFormat serializer.Format, result *diff.Result) error {
+// writeDiffResult serializes the diff result, using a custom table formatter
+// when the output format is table.
+func writeDiffResult(ctx context.Context, cmd *cli.Command, outFormat serializer.Format, result *diff.Result) error {
 	output := cmd.String("output")
+
+	// Use custom table writer for human-readable output
+	if outFormat == serializer.FormatTable {
+		w := os.Stdout
+		if output != "" {
+			f, err := os.Create(output)
+			if err != nil {
+				return errors.Wrap(errors.ErrCodeInternal, "failed to create output file", err)
+			}
+			defer f.Close()
+			w = f
+		}
+		return diff.WriteTable(w, result)
+	}
+
+	// JSON/YAML use standard serializer
 	ser, err := serializer.NewFileWriterOrStdout(outFormat, output)
 	if err != nil {
 		return errors.Wrap(errors.ErrCodeInternal, "failed to create output writer", err)
@@ -249,9 +272,5 @@ func writeResult(ctx context.Context, cmd *cli.Command, outFormat serializer.For
 		}
 	}()
 
-	if err := ser.Serialize(ctx, result); err != nil {
-		return errors.Wrap(errors.ErrCodeInternal, "failed to serialize diff result", err)
-	}
-
-	return nil
+	return ser.Serialize(ctx, result)
 }
