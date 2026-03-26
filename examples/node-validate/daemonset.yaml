@@ -1,17 +1,18 @@
-# Example DaemonSet for continuous per-node recipe compliance validation.
-# Runs aicr node-validate on every GPU node, labels nodes with compliance
-# status, and integrates with Skyhook's workload gate taint.
-#
-# Prerequisites:
-#   - AICR CLI image available (ghcr.io/nvidia/aicr)
-#   - Recipe stored as ConfigMap (aicr-recipe in aicr-validation namespace)
-#   - RBAC: ServiceAccount with node patch permissions (see rbac.yaml)
+# DaemonSet for continuous per-node recipe compliance validation.
+# Runs aicr node-validate on every GPU node in a loop, labels nodes
+# with compliance status, and integrates with Skyhook's workload gate.
 #
 # Autoscaler integration flow:
 #   Autoscaler adds node → GPU Operator installs drivers →
 #   Skyhook applies gate taint → node-validate DaemonSet pod starts →
 #   evaluates recipe constraints → labels node with compliance status →
-#   if compliant: Skyhook removes gate taint → KAI schedules workloads
+#   if compliant: external automation or Skyhook removes gate taint
+#   if non-compliant: taint remains → no GPU workloads scheduled
+#
+# Prerequisites:
+#   - AICR CLI image (ghcr.io/nvidia/aicr)
+#   - Recipe stored as ConfigMap: kubectl create configmap aicr-recipe \
+#       --from-file=recipe.yaml -n aicr-validation
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -36,8 +37,8 @@ spec:
       # Run on GPU nodes only
       nodeSelector:
         nvidia.com/gpu.present: "true"
-      # Tolerate Skyhook's workload gate taint so we can validate
-      # nodes before the taint is removed
+      # Tolerate all taints including Skyhook's workload gate
+      # so validation runs before the gate is removed
       tolerations:
         - operator: Exists
       containers:
@@ -49,11 +50,12 @@ spec:
             - --recipe
             - /etc/aicr/recipe.yaml
             - --label-node
-            - --fail-on-drift
+            - --interval
+            - "5m"
             - --format
             - json
           env:
-            # Node name via Downward API (used by collectors)
+            # Node name via Downward API (required by collectors)
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
@@ -69,25 +71,11 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
-          # Re-validate every 5 minutes
-          # In production, use a CronJob or adjust the liveness probe interval
-          livenessProbe:
-            exec:
-              command:
-                - aicr
-                - node-validate
-                - --recipe
-                - /etc/aicr/recipe.yaml
-                - --format
-                - json
-            initialDelaySeconds: 30
-            periodSeconds: 300
       volumes:
         - name: recipe
           configMap:
             name: aicr-recipe
 ---
-# RBAC for node-validate DaemonSet
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -109,11 +97,11 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "patch"]
-  # Snapshot collection (K8s collector)
+  # Snapshot collection (K8s collector needs pod/namespace listing)
   - apiGroups: [""]
     resources: ["pods", "namespaces", "configmaps"]
     verbs: ["get", "list"]
-  # ClusterPolicy collection (policy collector)
+  # ClusterPolicy collection (GPU Operator policy)
   - apiGroups: ["*"]
     resources: ["clusterpolicies"]
     verbs: ["get", "list"]

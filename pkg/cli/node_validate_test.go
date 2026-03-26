@@ -34,7 +34,7 @@ func TestNodeValidateCmd_CommandStructure(t *testing.T) {
 func TestNodeValidateCmd_RequiredFlags(t *testing.T) {
 	cmd := nodeValidateCmd()
 
-	requiredFlags := []string{"recipe", "fail-on-drift", "label-node", "output", "format", "kubeconfig", "data"}
+	requiredFlags := []string{"recipe", "fail-on-drift", "label-node", "interval", "output", "format", "kubeconfig", "data"}
 	for _, flagName := range requiredFlags {
 		found := false
 		for _, flag := range cmd.Flags {

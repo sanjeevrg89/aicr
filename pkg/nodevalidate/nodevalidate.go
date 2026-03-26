@@ -112,15 +112,11 @@ func ValidateNode(ctx context.Context, rec *recipe.RecipeResult, cfg Config) (*N
 }
 
 // LabelNode applies compliance labels to the node via Kubernetes API.
+// Uses the provided clientset to avoid creating a new client on each call.
 // Requires RBAC permission to patch nodes (verb: patch, resource: nodes).
-func LabelNode(ctx context.Context, kubeconfig string, result *NodeResult) error {
+func LabelNode(ctx context.Context, clientset k8sclient.Interface, result *NodeResult) error {
 	if result.NodeName == "" {
 		return errors.New(errors.ErrCodeInvalidRequest, "node name is empty — cannot label")
-	}
-
-	clientset, _, err := k8sclient.GetKubeClientWithConfig(kubeconfig)
-	if err != nil {
-		return errors.Wrap(errors.ErrCodeInternal, "failed to create kubernetes client", err)
 	}
 
 	labels := result.LabelValues()
@@ -153,6 +149,32 @@ func LabelNode(ctx context.Context, kubeconfig string, result *NodeResult) error
 		slog.String(LabelCompliance, labels[LabelCompliance]))
 
 	return nil
+}
+
+// RunLoop runs node validation repeatedly at the given interval until the context
+// is cancelled. Designed for DaemonSet execution where the container must stay alive.
+// On each iteration it validates, labels the node, and sleeps for the interval.
+func RunLoop(ctx context.Context, rec *recipe.RecipeResult, cfg Config, interval time.Duration, clientset k8sclient.Interface) error {
+	slog.Info("starting node-validate loop", slog.Duration("interval", interval))
+
+	for {
+		result, err := ValidateNode(ctx, rec, cfg)
+		if err != nil {
+			slog.Error("validation iteration failed", slog.String("error", err.Error()))
+		} else if clientset != nil {
+			if labelErr := LabelNode(ctx, clientset, result); labelErr != nil {
+				slog.Warn("failed to label node", slog.String("error", labelErr.Error()))
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			slog.Info("node-validate loop stopped")
+			return nil
+		case <-time.After(interval):
+			// next iteration
+		}
+	}
 }
 
 // collectLocalSnapshot runs collectors locally (same pattern as NodeSnapshotter.measure)

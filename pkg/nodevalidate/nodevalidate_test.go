@@ -17,6 +17,7 @@ package nodevalidate
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/NVIDIA/aicr/pkg/diff"
 	"github.com/NVIDIA/aicr/pkg/header"
@@ -208,9 +209,8 @@ func TestNodeValidation_EmptyConstraints(t *testing.T) {
 	}
 }
 
-// TestLabelNode_WithFakeClient tests actual node labeling using a fake K8s clientset.
-func TestLabelNode_WithFakeClient(t *testing.T) {
-	// Create a fake node
+// TestLabelNode_Compliant tests LabelNode directly with a fake K8s clientset.
+func TestLabelNode_Compliant(t *testing.T) {
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "gpu-node-1",
@@ -219,29 +219,16 @@ func TestLabelNode_WithFakeClient(t *testing.T) {
 	}
 	clientset := fake.NewSimpleClientset(node)
 
-	// Build a compliant result
 	result := &NodeResult{
 		NodeName:  "gpu-node-1",
 		Compliant: true,
 		Timestamp: "2026-03-25T14:00:00Z",
-		DiffResult: &diff.Result{
-			Mode: "recipe-vs-snapshot",
-		},
+		DiffResult: &diff.Result{Mode: "recipe-vs-snapshot"},
 	}
 
-	// Patch the node directly using the fake clientset (bypasses LabelNode's client creation)
-	labels := result.LabelValues()
-	patchData := []byte(`{"metadata":{"labels":{"` + LabelCompliance + `":"` + labels[LabelCompliance] + `","` + LabelLastValidated + `":"` + labels[LabelLastValidated] + `"}}}`)
-
-	_, err := clientset.CoreV1().Nodes().Patch(
-		context.Background(),
-		result.NodeName,
-		"application/strategic-merge-patch+json",
-		patchData,
-		metav1.PatchOptions{},
-	)
-	if err != nil {
-		t.Fatalf("failed to patch node: %v", err)
+	// Call LabelNode directly — tests the actual function, not a manual patch
+	if err := LabelNode(context.Background(), clientset, result); err != nil {
+		t.Fatalf("LabelNode failed: %v", err)
 	}
 
 	// Verify labels were applied
@@ -254,9 +241,9 @@ func TestLabelNode_WithFakeClient(t *testing.T) {
 		t.Errorf("expected %s=true, got %q", LabelCompliance, updated.Labels[LabelCompliance])
 	}
 	if updated.Labels[LabelLastValidated] != "2026-03-25T14:00:00Z" {
-		t.Errorf("expected %s timestamp, got %q", LabelLastValidated, updated.Labels[LabelLastValidated])
+		t.Errorf("expected timestamp, got %q", updated.Labels[LabelLastValidated])
 	}
-	// Verify existing labels are preserved
+	// Existing labels must be preserved
 	if updated.Labels["existing-label"] != "value" {
 		t.Errorf("existing label was overwritten")
 	}
@@ -265,9 +252,7 @@ func TestLabelNode_WithFakeClient(t *testing.T) {
 // TestLabelNode_NonCompliant verifies non-compliant label is set correctly.
 func TestLabelNode_NonCompliant(t *testing.T) {
 	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "gpu-node-2",
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu-node-2"},
 	}
 	clientset := fake.NewSimpleClientset(node)
 
@@ -275,23 +260,11 @@ func TestLabelNode_NonCompliant(t *testing.T) {
 		NodeName:  "gpu-node-2",
 		Compliant: false,
 		Timestamp: "2026-03-25T15:00:00Z",
-		DiffResult: &diff.Result{
-			Mode: "recipe-vs-snapshot",
-		},
+		DiffResult: &diff.Result{Mode: "recipe-vs-snapshot"},
 	}
 
-	labels := result.LabelValues()
-	patchData := []byte(`{"metadata":{"labels":{"` + LabelCompliance + `":"` + labels[LabelCompliance] + `","` + LabelLastValidated + `":"` + labels[LabelLastValidated] + `"}}}`)
-
-	_, err := clientset.CoreV1().Nodes().Patch(
-		context.Background(),
-		result.NodeName,
-		"application/strategic-merge-patch+json",
-		patchData,
-		metav1.PatchOptions{},
-	)
-	if err != nil {
-		t.Fatalf("failed to patch node: %v", err)
+	if err := LabelNode(context.Background(), clientset, result); err != nil {
+		t.Fatalf("LabelNode failed: %v", err)
 	}
 
 	updated, err := clientset.CoreV1().Nodes().Get(context.Background(), "gpu-node-2", metav1.GetOptions{})
@@ -301,5 +274,33 @@ func TestLabelNode_NonCompliant(t *testing.T) {
 
 	if updated.Labels[LabelCompliance] != "false" {
 		t.Errorf("expected %s=false, got %q", LabelCompliance, updated.Labels[LabelCompliance])
+	}
+}
+
+// TestLabelNode_EmptyNodeName verifies error on empty node name.
+func TestLabelNode_EmptyNodeName(t *testing.T) {
+	clientset := fake.NewSimpleClientset()
+	result := &NodeResult{
+		NodeName:   "",
+		DiffResult: &diff.Result{Mode: "recipe-vs-snapshot"},
+	}
+
+	err := LabelNode(context.Background(), clientset, result)
+	if err == nil {
+		t.Error("expected error for empty node name")
+	}
+}
+
+// TestRunLoop_Cancellation verifies RunLoop exits cleanly on context cancellation.
+func TestRunLoop_Cancellation(t *testing.T) {
+	rec := &recipe.RecipeResult{Constraints: []recipe.Constraint{}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel immediately so RunLoop exits after first iteration
+	cancel()
+
+	err := RunLoop(ctx, rec, Config{}, 1*time.Second, nil)
+	if err != nil {
+		t.Errorf("expected nil error on cancellation, got: %v", err)
 	}
 }

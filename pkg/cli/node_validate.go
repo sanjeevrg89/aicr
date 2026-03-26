@@ -24,6 +24,7 @@ import (
 
 	"github.com/NVIDIA/aicr/pkg/diff"
 	"github.com/NVIDIA/aicr/pkg/errors"
+	k8sclient "github.com/NVIDIA/aicr/pkg/k8s/client"
 	"github.com/NVIDIA/aicr/pkg/nodevalidate"
 	"github.com/NVIDIA/aicr/pkg/recipe"
 	"github.com/NVIDIA/aicr/pkg/serializer"
@@ -47,18 +48,21 @@ Use --label-node to set the aicr.nvidia.com/recipe-compliant label
 on the node based on the validation result. Requires RBAC permission
 to patch nodes.
 
+Use --interval to run continuously in a loop (for DaemonSet mode).
+The container stays alive and re-validates at each interval.
+
 Examples:
-  # Validate this node against a recipe
+  # One-shot: validate this node against a recipe
   aicr node-validate --recipe recipe.yaml
+
+  # Continuous: validate every 5 minutes and label the node (DaemonSet mode)
+  aicr node-validate --recipe recipe.yaml --label-node --interval 5m
 
   # JSON output for logging/metrics pipelines
   aicr node-validate --recipe recipe.yaml --format json
 
-  # Fail with non-zero exit if node is non-compliant
-  aicr node-validate --recipe recipe.yaml --fail-on-drift
-
-  # Label the node with compliance status (requires cluster RBAC)
-  aicr node-validate --recipe recipe.yaml --label-node`,
+  # Fail with non-zero exit if node is non-compliant (init container mode)
+  aicr node-validate --recipe recipe.yaml --fail-on-drift`,
 		Flags: nodeValidateCmdFlags(),
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			return runNodeValidateCmd(ctx, cmd)
@@ -80,9 +84,14 @@ func nodeValidateCmdFlags() []cli.Flag {
 			Usage:    fmt.Sprintf("set %s label on this node based on result (requires node patch RBAC)", nodevalidate.LabelCompliance),
 			Category: "Node",
 		},
+		&cli.DurationFlag{
+			Name:     "interval",
+			Usage:    "run continuously at this interval (e.g., 5m, 1h). Without this flag, runs once and exits.",
+			Category: "Node",
+		},
 		&cli.BoolFlag{
 			Name:     "fail-on-drift",
-			Usage:    "exit with non-zero status if node is non-compliant",
+			Usage:    "exit with non-zero status if node is non-compliant (one-shot mode only)",
 			Category: "Output",
 		},
 		outputFlag,
@@ -93,7 +102,7 @@ func nodeValidateCmdFlags() []cli.Flag {
 }
 
 func runNodeValidateCmd(ctx context.Context, cmd *cli.Command) error {
-	if err := validateSingleValueFlags(cmd, "recipe", "output", "format"); err != nil {
+	if err := validateSingleValueFlags(cmd, "recipe", "output", "format", "interval"); err != nil {
 		return err
 	}
 
@@ -108,36 +117,55 @@ func runNodeValidateCmd(ctx context.Context, cmd *cli.Command) error {
 
 	recipePath := cmd.String("recipe")
 	kubeconfig := cmd.String("kubeconfig")
-
-	slog.Debug("loading recipe", slog.String("path", recipePath))
+	interval := cmd.Duration("interval")
 
 	rec, err := serializer.FromFileWithKubeconfig[recipe.RecipeResult](recipePath, kubeconfig)
 	if err != nil {
 		return errors.Wrap(errors.ErrCodeInternal, fmt.Sprintf("failed to load recipe from %q", recipePath), err)
 	}
 
-	// Run node validation (collectors + constraint evaluation)
-	result, err := nodevalidate.ValidateNode(ctx, rec, nodevalidate.Config{
-		Version: version,
-	})
+	cfg := nodevalidate.Config{Version: version}
+
+	// Loop mode: run continuously for DaemonSet execution
+	if interval > 0 {
+		if cmd.Bool("fail-on-drift") {
+			return errors.New(errors.ErrCodeInvalidRequest, "--fail-on-drift cannot be used with --interval (loop never exits on drift)")
+		}
+
+		var clientset k8sclient.Interface
+		if cmd.Bool("label-node") {
+			cs, _, csErr := getNodeValidateClient(kubeconfig)
+			if csErr != nil {
+				return csErr
+			}
+			clientset = cs
+		}
+
+		return nodevalidate.RunLoop(ctx, rec, cfg, interval, clientset)
+	}
+
+	// One-shot mode: validate once and exit
+	result, err := nodevalidate.ValidateNode(ctx, rec, cfg)
 	if err != nil {
 		return err
 	}
 
-	// Label node if requested
 	if cmd.Bool("label-node") {
-		if labelErr := nodevalidate.LabelNode(ctx, kubeconfig, result); labelErr != nil {
-			slog.Warn("failed to label node — continuing with output",
-				slog.String("error", labelErr.Error()))
+		clientset, _, csErr := getNodeValidateClient(kubeconfig)
+		if csErr != nil {
+			slog.Warn("failed to create kubernetes client for labeling", slog.String("error", csErr.Error()))
+		} else {
+			if labelErr := nodevalidate.LabelNode(ctx, clientset, result); labelErr != nil {
+				slog.Warn("failed to label node — continuing with output",
+					slog.String("error", labelErr.Error()))
+			}
 		}
 	}
 
-	// Write output
 	if err := writeNodeValidateResult(ctx, cmd, outFormat, result); err != nil {
 		return err
 	}
 
-	// Fail if non-compliant and --fail-on-drift set
 	if cmd.Bool("fail-on-drift") && !result.Compliant {
 		failed := result.FailedConstraints()
 		errConstraints := result.ErrorConstraints()
@@ -149,11 +177,21 @@ func runNodeValidateCmd(ctx context.Context, cmd *cli.Command) error {
 	return nil
 }
 
+// getNodeValidateClient returns a K8s clientset for node labeling.
+// Uses BuildKubeClient with the provided kubeconfig to avoid polluting
+// the singleton cache (GetKubeClient) when a custom kubeconfig is specified.
+func getNodeValidateClient(kubeconfig string) (k8sclient.Interface, interface{}, error) {
+	if kubeconfig != "" {
+		return k8sclient.GetKubeClientWithConfig(kubeconfig)
+	}
+	clientset, config, err := k8sclient.GetKubeClient()
+	return clientset, config, err
+}
+
 // writeNodeValidateResult serializes the node validation result.
 func writeNodeValidateResult(ctx context.Context, cmd *cli.Command, outFormat serializer.Format, result *nodevalidate.NodeResult) error {
 	output := cmd.String("output")
 
-	// Table output uses the diff table writer for the constraint/component detail
 	if outFormat == serializer.FormatTable {
 		w := os.Stdout
 		if output != "" {
@@ -174,7 +212,6 @@ func writeNodeValidateResult(ctx context.Context, cmd *cli.Command, outFormat se
 		return diff.WriteTable(w, result.DiffResult)
 	}
 
-	// JSON/YAML use standard serializer
 	ser, err := serializer.NewFileWriterOrStdout(outFormat, output)
 	if err != nil {
 		return errors.Wrap(errors.ErrCodeInternal, "failed to create output writer", err)
