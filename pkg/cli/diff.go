@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/urfave/cli/v3"
 
@@ -174,9 +175,14 @@ func runRecipeDiff(ctx context.Context, cmd *cli.Command, recipePath, snapshotPa
 		return errors.Wrap(errors.ErrCodeInternal, fmt.Sprintf("failed to load snapshot from %q", snapshotPath), err)
 	}
 
+	start := time.Now()
 	result := diff.RecipeVsSnapshot(rec, snap)
+	duration := time.Since(start)
 	result.BaselineSource = recipePath
 	result.TargetSource = snapshotPath
+
+	// Record Prometheus metrics for fleet observability
+	diff.RecordMetrics(result, duration.Seconds())
 
 	slog.Info("recipe diff complete",
 		slog.Int("passed", result.Summary.ConstraintsPassed),
