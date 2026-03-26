@@ -388,7 +388,7 @@ func TestRecipeVsSnapshot_ComponentMissing(t *testing.T) {
 	if result.Summary.ComponentsDrifted != 1 {
 		t.Errorf("expected 1 component drifted, got %d", result.Summary.ComponentsDrifted)
 	}
-	if result.ComponentDrifts[0].Status != "not-observed" {
+	if result.ComponentDrifts[0].Status != ComponentStatusNotObserved {
 		t.Errorf("expected status missing, got %s", result.ComponentDrifts[0].Status)
 	}
 	if !result.HasDrift() {
@@ -413,7 +413,7 @@ func TestRecipeVsSnapshot_ComponentVersionMismatch(t *testing.T) {
 
 	result := RecipeVsSnapshot(rec, snap)
 
-	if result.ComponentDrifts[0].Status != "version-mismatch" {
+	if result.ComponentDrifts[0].Status != ComponentStatusMismatch {
 		t.Errorf("expected status version-mismatch, got %s", result.ComponentDrifts[0].Status)
 	}
 	if result.ComponentDrifts[0].ExpectedVersion != "24.9.0" || result.ComponentDrifts[0].ActualVersion != "24.6.0" {
@@ -527,7 +527,7 @@ func TestWriteTable_RecipeMode(t *testing.T) {
 			{Name: "OS.release.ID", Expected: "ubuntu", Actual: "ubuntu", Passed: true, Severity: SeverityError},
 		},
 		ComponentDrifts: []ComponentDrift{
-			{Name: "gpu-operator", ExpectedVersion: "24.9.0", ActualVersion: "24.6.0", Status: "version-mismatch"},
+			{Name: "gpu-operator", ExpectedVersion: "24.9.0", ActualVersion: "24.6.0", Status: ComponentStatusMismatch},
 		},
 		Summary: Summary{ConstraintsPassed: 1, ConstraintsFailed: 1, ComponentsDrifted: 1},
 	}

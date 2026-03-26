@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"time"
 
 	"github.com/urfave/cli/v3"
 
@@ -128,6 +127,10 @@ func runDiffCmd(ctx context.Context, cmd *cli.Command) error {
 	baselinePath := cmd.String("baseline")
 	targetPath := cmd.String("target")
 
+	if err := initDataProvider(cmd); err != nil {
+		return err
+	}
+
 	hasRecipeMode := recipePath != "" || snapshotPath != ""
 	hasSnapshotMode := baselinePath != "" || targetPath != ""
 
@@ -157,10 +160,6 @@ func runRecipeDiff(ctx context.Context, cmd *cli.Command, recipePath, snapshotPa
 		return errors.New(errors.ErrCodeInvalidRequest, "--snapshot is required in recipe mode")
 	}
 
-	if err := initDataProvider(cmd); err != nil {
-		return err
-	}
-
 	kubeconfig := cmd.String("kubeconfig")
 
 	slog.Debug("recipe mode", slog.String("recipe", recipePath), slog.String("snapshot", snapshotPath))
@@ -175,14 +174,9 @@ func runRecipeDiff(ctx context.Context, cmd *cli.Command, recipePath, snapshotPa
 		return errors.Wrap(errors.ErrCodeInternal, fmt.Sprintf("failed to load snapshot from %q", snapshotPath), err)
 	}
 
-	start := time.Now()
 	result := diff.RecipeVsSnapshot(rec, snap)
-	duration := time.Since(start)
 	result.BaselineSource = recipePath
 	result.TargetSource = snapshotPath
-
-	// Record Prometheus metrics for fleet observability
-	diff.RecordMetrics(result, duration.Seconds())
 
 	slog.Info("recipe diff complete",
 		slog.Int("passed", result.Summary.ConstraintsPassed),
@@ -196,7 +190,7 @@ func runRecipeDiff(ctx context.Context, cmd *cli.Command, recipePath, snapshotPa
 	}
 
 	if cmd.Bool("fail-on-drift") && result.HasDrift() {
-		return errors.New(errors.ErrCodeInvalidRequest,
+		return errors.New(errors.ErrCodeInternal,
 			fmt.Sprintf("drift detected: %d constraint(s) failed, %d component(s) drifted",
 				result.Summary.ConstraintsFailed, result.Summary.ComponentsDrifted))
 	}
@@ -241,7 +235,7 @@ func runSnapshotDiff(ctx context.Context, cmd *cli.Command, baselinePath, target
 	}
 
 	if cmd.Bool("fail-on-drift") && result.HasDrift() {
-		return errors.New(errors.ErrCodeInvalidRequest,
+		return errors.New(errors.ErrCodeInternal,
 			fmt.Sprintf("drift detected: %d change(s) found", result.Summary.Total))
 	}
 

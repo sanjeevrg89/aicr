@@ -141,7 +141,7 @@ func runNodeValidateCmd(ctx context.Context, cmd *cli.Command) error {
 
 		var clientset k8sclient.Interface
 		if cmd.Bool("label-node") {
-			cs, _, csErr := getNodeValidateClient(kubeconfig)
+			cs, csErr := getNodeValidateClient(kubeconfig)
 			if csErr != nil {
 				return csErr
 			}
@@ -174,7 +174,7 @@ func runNodeValidateCmd(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	if cmd.Bool("label-node") {
-		clientset, _, csErr := getNodeValidateClient(kubeconfig)
+		clientset, csErr := getNodeValidateClient(kubeconfig)
 		if csErr != nil {
 			slog.Warn("failed to create kubernetes client for labeling", slog.String("error", csErr.Error()))
 		} else {
@@ -201,14 +201,15 @@ func runNodeValidateCmd(ctx context.Context, cmd *cli.Command) error {
 }
 
 // getNodeValidateClient returns a K8s clientset for node labeling.
-// Uses BuildKubeClient with the provided kubeconfig to avoid polluting
-// the singleton cache (GetKubeClient) when a custom kubeconfig is specified.
-func getNodeValidateClient(kubeconfig string) (k8sclient.Interface, interface{}, error) {
+// Uses the singleton GetKubeClient by default; uses BuildKubeClient
+// for explicit kubeconfig to avoid polluting the singleton cache.
+func getNodeValidateClient(kubeconfig string) (k8sclient.Interface, error) {
 	if kubeconfig != "" {
-		return k8sclient.GetKubeClientWithConfig(kubeconfig)
+		cs, _, err := k8sclient.GetKubeClientWithConfig(kubeconfig)
+		return cs, err
 	}
-	clientset, config, err := k8sclient.GetKubeClient()
-	return clientset, config, err
+	cs, _, err := k8sclient.GetKubeClient()
+	return cs, err
 }
 
 // writeNodeValidateResult serializes the node validation result.
@@ -222,7 +223,11 @@ func writeNodeValidateResult(ctx context.Context, cmd *cli.Command, outFormat se
 			if err != nil {
 				return errors.Wrap(errors.ErrCodeInternal, "failed to create output file", err)
 			}
-			defer f.Close()
+			defer func() {
+				if closeErr := f.Close(); closeErr != nil {
+					slog.Warn("failed to close output file", slog.String("error", closeErr.Error()))
+				}
+			}()
 			w = f
 		}
 		fmt.Fprintf(w, "NODE: %s\n", result.NodeName)

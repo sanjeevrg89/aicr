@@ -98,6 +98,18 @@ spec:
             - name: recipe
               mountPath: /etc/aicr
               readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 60
           resources:
             requests:
               cpu: 100m
@@ -136,7 +148,7 @@ rules:
     resources: ["pods", "namespaces", "configmaps"]
     verbs: ["get", "list"]
   # ClusterPolicy collection (GPU Operator policy)
-  - apiGroups: ["*"]
+  - apiGroups: ["nvidia.com"]
     resources: ["clusterpolicies"]
     verbs: ["get", "list"]
 ---

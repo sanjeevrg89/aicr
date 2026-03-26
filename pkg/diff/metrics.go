@@ -97,6 +97,8 @@ var (
 
 // RecordMetrics updates Prometheus metrics from a diff result.
 // Call this after each drift check to keep metrics current.
+// Resets per-constraint and per-component gauges before setting new values
+// to avoid stale series from renamed/removed constraints or components.
 // Safe to call from any goroutine — prometheus metrics are thread-safe.
 func RecordMetrics(result *Result, duration float64) {
 	// Record duration
@@ -111,6 +113,10 @@ func RecordMetrics(result *Result, duration float64) {
 		checkResult = "drift"
 	}
 	driftCheckTotal.WithLabelValues(result.Mode, checkResult).Inc()
+
+	// Reset per-label gauges to avoid stale series from previous checks
+	constraintStatus.Reset()
+	componentDriftStatus.Reset()
 
 	// Record per-constraint status
 	for _, cr := range result.ConstraintResults {
@@ -130,11 +136,11 @@ func RecordMetrics(result *Result, duration float64) {
 	for _, cd := range result.ComponentDrifts {
 		var value float64
 		switch cd.Status {
-		case "ok":
+		case ComponentStatusOK:
 			value = 1
-		case "version-mismatch":
+		case ComponentStatusMismatch:
 			value = 0
-		default: // not-observed
+		default: // ComponentStatusNotObserved
 			value = -1
 		}
 		componentDriftStatus.WithLabelValues(cd.Name, cd.Namespace).Set(value)

@@ -85,6 +85,13 @@ type ConstraintResult struct {
 	Error string `json:"error,omitempty" yaml:"error,omitempty"`
 }
 
+// Component drift status constants.
+const (
+	ComponentStatusOK          = "ok"
+	ComponentStatusMismatch    = "version-mismatch"
+	ComponentStatusNotObserved = "not-observed"
+)
+
 // ComponentDrift represents drift in a recipe component's version or presence.
 type ComponentDrift struct {
 	// Name is the component name (e.g., "gpu-operator").
@@ -95,7 +102,7 @@ type ComponentDrift struct {
 	ActualVersion string `json:"actualVersion,omitempty" yaml:"actualVersion,omitempty"`
 	// Namespace is the expected deployment namespace.
 	Namespace string `json:"namespace,omitempty" yaml:"namespace,omitempty"`
-	// Status describes the drift (e.g., "missing", "version-mismatch", "ok").
+	// Status describes the drift (ComponentStatusOK, ComponentStatusMismatch, ComponentStatusNotObserved).
 	Status string `json:"status" yaml:"status"`
 }
 
@@ -154,7 +161,12 @@ func (r *Result) HasDrift() bool {
 
 // Snapshots compares two snapshots and returns a structured diff result.
 // The baseline is the reference state; the target is the current state.
+// Both baseline and target must be non-nil.
 func Snapshots(baseline, target *snapshotter.Snapshot) *Result {
+	if baseline == nil || target == nil {
+		return &Result{Mode: "snapshot-vs-snapshot", Changes: make([]Change, 0)}
+	}
+
 	result := &Result{
 		Mode:    "snapshot-vs-snapshot",
 		Changes: make([]Change, 0),
@@ -245,20 +257,26 @@ func RecipeVsSnapshot(rec *recipe.RecipeResult, snap *snapshotter.Snapshot) *Res
 	result.ComponentDrifts = checkComponentDrift(rec, snap)
 	for _, cd := range result.ComponentDrifts {
 		switch cd.Status {
-		case "ok":
+		case ComponentStatusOK:
 			result.Summary.ComponentsOK++
-		case "version-mismatch":
-			result.Summary.ComponentsDrifted++
 		default:
-			// "not-observed" — component image not found in snapshot.
-			// This is informational, not definitive drift (pod may not have
-			// been running during snapshot collection).
 			result.Summary.ComponentsDrifted++
 		}
 	}
 
-	// 3. Summarize validation phase configuration
+	// 3. Summarize validation phase configuration and count phase-level constraints
 	result.ValidationPhases = checkValidationPhases(rec, snap)
+	for _, vp := range result.ValidationPhases {
+		for _, cr := range vp.ConstraintResults {
+			if cr.Error != "" {
+				result.Summary.ConstraintsError++
+			} else if cr.Passed {
+				result.Summary.ConstraintsPassed++
+			} else {
+				result.Summary.ConstraintsFailed++
+			}
+		}
+	}
 
 	result.Summary.Total = len(result.ConstraintResults)
 
@@ -293,14 +311,14 @@ func checkComponentDrift(rec *recipe.RecipeResult, snap *snapshotter.Snapshot) [
 		}
 
 		if !found {
-			cd.Status = "not-observed"
+			cd.Status = ComponentStatusNotObserved
 			cd.ActualVersion = ""
 		} else {
 			cd.ActualVersion = actualVersion
 			if ref.Version != "" && actualVersion != "" && actualVersion != ref.Version {
-				cd.Status = "version-mismatch"
+				cd.Status = ComponentStatusMismatch
 			} else {
-				cd.Status = "ok"
+				cd.Status = ComponentStatusOK
 			}
 		}
 
@@ -451,7 +469,7 @@ func compareMeasurements(base, target *measurement.Measurement) []Change {
 func compareReadings(prefix string, base, target map[string]measurement.Reading) []Change {
 	var changes []Change
 
-	allKeys := mergeReadingKeys(base, target)
+	allKeys := mergeKeys(base, target)
 	sort.Strings(allKeys)
 
 	for _, key := range allKeys {
@@ -533,17 +551,3 @@ func mergeKeys[V any](a, b map[string]V) []string {
 	return keys
 }
 
-func mergeReadingKeys(a, b map[string]measurement.Reading) []string {
-	seen := make(map[string]struct{}, len(a)+len(b))
-	for k := range a {
-		seen[k] = struct{}{}
-	}
-	for k := range b {
-		seen[k] = struct{}{}
-	}
-	keys := make([]string, 0, len(seen))
-	for k := range seen {
-		keys = append(keys, k)
-	}
-	return keys
-}

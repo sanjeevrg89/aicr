@@ -166,6 +166,8 @@ func RunLoop(ctx context.Context, rec *recipe.RecipeResult, cfg Config, interval
 		result, err := ValidateNode(ctx, rec, cfg)
 		if err != nil {
 			slog.Error("validation iteration failed", slog.String("error", err.Error()))
+			nodeName := k8s.GetNodeName()
+			nodeValidationTotal.WithLabelValues(nodeName, "error").Inc()
 		} else if clientset != nil {
 			if labelErr := LabelNode(ctx, clientset, result); labelErr != nil {
 				slog.Warn("failed to label node", slog.String("error", labelErr.Error()))
@@ -217,8 +219,14 @@ func collectLocalSnapshot(ctx context.Context, nodeName string, cfg Config) (*sn
 	g.Go(collectSafe("gpu", factory.CreateGPUCollector()))
 	g.Go(collectSafe("os", factory.CreateOSCollector()))
 	g.Go(collectSafe("systemd", factory.CreateSystemDCollector()))
+	g.Go(collectSafe("topology", factory.CreateNodeTopologyCollector()))
 
 	_ = g.Wait()
+
+	if len(snap.Measurements) == 0 {
+		return nil, errors.New(errors.ErrCodeInternal,
+			"all collectors failed — cannot evaluate recipe constraints against empty snapshot")
+	}
 
 	slog.Debug("local snapshot collected", slog.Int("measurements", len(snap.Measurements)))
 	return snap, nil
