@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NVIDIA/aicr/pkg/collector"
 	"github.com/NVIDIA/aicr/pkg/diff"
 	"github.com/NVIDIA/aicr/pkg/header"
 	"github.com/NVIDIA/aicr/pkg/measurement"
@@ -291,15 +292,133 @@ func TestLabelNode_EmptyNodeName(t *testing.T) {
 	}
 }
 
+// mockCollector returns a fixed measurement for testing.
+type mockCollector struct {
+	mtype   measurement.Type
+	subtype string
+	data    map[string]measurement.Reading
+}
+
+func (c *mockCollector) Collect(_ context.Context) (*measurement.Measurement, error) {
+	return &measurement.Measurement{
+		Type:     c.mtype,
+		Subtypes: []measurement.Subtype{{Name: c.subtype, Data: c.data}},
+	}, nil
+}
+
+// mockFactory provides predetermined measurements without real system access.
+type mockFactory struct {
+	k8s  map[string]measurement.Reading
+	gpu  map[string]measurement.Reading
+	osR  map[string]measurement.Reading
+	sysd map[string]measurement.Reading
+}
+
+func (f *mockFactory) CreateKubernetesCollector() collector.Collector {
+	return &mockCollector{mtype: measurement.TypeK8s, subtype: "server", data: f.k8s}
+}
+func (f *mockFactory) CreateGPUCollector() collector.Collector {
+	return &mockCollector{mtype: measurement.TypeGPU, subtype: "device", data: f.gpu}
+}
+func (f *mockFactory) CreateOSCollector() collector.Collector {
+	return &mockCollector{mtype: measurement.TypeOS, subtype: "release", data: f.osR}
+}
+func (f *mockFactory) CreateSystemDCollector() collector.Collector {
+	return &mockCollector{mtype: measurement.TypeSystemD, subtype: "kubelet", data: f.sysd}
+}
+func (f *mockFactory) CreateNodeTopologyCollector() collector.Collector {
+	return &mockCollector{mtype: measurement.TypeNodeTopology, subtype: "labels", data: map[string]measurement.Reading{}}
+}
+
+// TestValidateNode_WithMockFactory exercises ValidateNode end-to-end
+// with injected mock collectors — no real system access.
+func TestValidateNode_WithMockFactory(t *testing.T) {
+	rec := &recipe.RecipeResult{
+		Constraints: []recipe.Constraint{
+			{Name: "K8s.server.version", Value: ">= 1.32", Severity: "error"},
+			{Name: "GPU.device.driver", Value: ">= 535.0", Severity: "warning"},
+			{Name: "OS.release.ID", Value: "ubuntu", Severity: "error"},
+		},
+	}
+
+	cfg := Config{
+		Version: "test",
+		Factory: &mockFactory{
+			k8s: map[string]measurement.Reading{"version": measurement.Str("1.32.4")},
+			gpu: map[string]measurement.Reading{"driver": measurement.Str("550.54.15")},
+			osR: map[string]measurement.Reading{"ID": measurement.Str("ubuntu")},
+		},
+	}
+
+	t.Setenv("NODE_NAME", "mock-gpu-node")
+
+	result, err := ValidateNode(context.Background(), rec, cfg)
+	if err != nil {
+		t.Fatalf("ValidateNode failed: %v", err)
+	}
+
+	if !result.Compliant {
+		t.Errorf("expected compliant node")
+	}
+	if result.NodeName != "mock-gpu-node" {
+		t.Errorf("expected node name mock-gpu-node, got %s", result.NodeName)
+	}
+	if result.DiffResult.Summary.ConstraintsPassed != 3 {
+		t.Errorf("expected 3 passed constraints, got %d", result.DiffResult.Summary.ConstraintsPassed)
+	}
+}
+
+// TestValidateNode_NonCompliantWithMock exercises ValidateNode with a failing constraint.
+func TestValidateNode_NonCompliantWithMock(t *testing.T) {
+	rec := &recipe.RecipeResult{
+		Constraints: []recipe.Constraint{
+			{Name: "K8s.server.version", Value: ">= 1.32", Severity: "error", Remediation: "Upgrade K8s"},
+		},
+	}
+
+	cfg := Config{
+		Version: "test",
+		Factory: &mockFactory{
+			k8s: map[string]measurement.Reading{"version": measurement.Str("1.31.0")},
+			gpu: map[string]measurement.Reading{},
+			osR: map[string]measurement.Reading{},
+		},
+	}
+
+	t.Setenv("NODE_NAME", "mock-gpu-node")
+
+	result, err := ValidateNode(context.Background(), rec, cfg)
+	if err != nil {
+		t.Fatalf("ValidateNode failed: %v", err)
+	}
+
+	if result.Compliant {
+		t.Errorf("expected non-compliant node")
+	}
+	if len(result.FailedConstraints()) != 1 {
+		t.Errorf("expected 1 failed constraint, got %d", len(result.FailedConstraints()))
+	}
+}
+
 // TestRunLoop_Cancellation verifies RunLoop exits cleanly on context cancellation.
 func TestRunLoop_Cancellation(t *testing.T) {
 	rec := &recipe.RecipeResult{Constraints: []recipe.Constraint{}}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	// Cancel immediately so RunLoop exits after first iteration
-	cancel()
+	cfg := Config{
+		Version: "test",
+		Factory: &mockFactory{
+			k8s: map[string]measurement.Reading{},
+			gpu: map[string]measurement.Reading{},
+			osR: map[string]measurement.Reading{},
+		},
+	}
 
-	err := RunLoop(ctx, rec, Config{}, 1*time.Second, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately so RunLoop exits after first iteration
+
+	t.Setenv("NODE_NAME", "mock-node")
+
+	err := RunLoop(ctx, rec, cfg, 1*time.Second, nil)
 	if err != nil {
 		t.Errorf("expected nil error on cancellation, got: %v", err)
 	}

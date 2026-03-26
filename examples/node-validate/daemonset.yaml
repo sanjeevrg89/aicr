@@ -1,3 +1,31 @@
+# ============================================================================
+# WORKLOAD GATING
+# ============================================================================
+# node-validate labels each GPU node with:
+#   aicr.nvidia.com/recipe-compliant: "true" | "false"
+#   aicr.nvidia.com/last-validated: <RFC3339 timestamp>
+#
+# To gate GPU workloads on compliant nodes, add a nodeSelector to your
+# training/inference pods:
+#
+#   spec:
+#     nodeSelector:
+#       aicr.nvidia.com/recipe-compliant: "true"
+#
+# Or configure KAI Scheduler / Kueue ResourceFlavors to target only
+# compliant nodes:
+#
+#   apiVersion: kueue.x-k8s.io/v1beta1
+#   kind: ResourceFlavor
+#   metadata:
+#     name: compliant-h100
+#   spec:
+#     nodeLabels:
+#       nvidia.com/gpu.present: "true"
+#       aicr.nvidia.com/recipe-compliant: "true"
+#
+# ============================================================================
+#
 # DaemonSet for continuous per-node recipe compliance validation.
 # Runs aicr node-validate on every GPU node in a loop, labels nodes
 # with compliance status, and integrates with Skyhook's workload gate.
