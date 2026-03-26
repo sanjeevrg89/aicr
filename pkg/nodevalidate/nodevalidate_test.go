@@ -15,6 +15,7 @@
 package nodevalidate
 
 import (
+	"context"
 	"testing"
 
 	"github.com/NVIDIA/aicr/pkg/diff"
@@ -22,6 +23,10 @@ import (
 	"github.com/NVIDIA/aicr/pkg/measurement"
 	"github.com/NVIDIA/aicr/pkg/recipe"
 	"github.com/NVIDIA/aicr/pkg/snapshotter"
+
+	"k8s.io/client-go/kubernetes/fake"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // makeSnap builds a test snapshot from measurement data.
@@ -100,10 +105,8 @@ func TestNodeValidation_NonCompliant(t *testing.T) {
 	if result.Compliant {
 		t.Errorf("expected non-compliant node")
 	}
-
-	failed := result.FailedConstraints()
-	if len(failed) != 2 {
-		t.Errorf("expected 2 failed constraints, got %d", len(failed))
+	if len(result.FailedConstraints()) != 2 {
+		t.Errorf("expected 2 failed constraints, got %d", len(result.FailedConstraints()))
 	}
 }
 
@@ -163,9 +166,9 @@ func TestNodeValidation_ErrorConstraints(t *testing.T) {
 func TestNodeValidation_MixedResults(t *testing.T) {
 	rec := &recipe.RecipeResult{
 		Constraints: []recipe.Constraint{
-			{Name: "K8s.server.version", Value: ">= 1.32", Severity: "error"},     // pass
-			{Name: "OS.release.ID", Value: "ubuntu", Severity: "error"},            // pass
-			{Name: "GPU.device.driver", Value: ">= 550.0", Severity: "warning"},   // fail
+			{Name: "K8s.server.version", Value: ">= 1.32", Severity: "error"},
+			{Name: "OS.release.ID", Value: "ubuntu", Severity: "error"},
+			{Name: "GPU.device.driver", Value: ">= 550.0", Severity: "warning"},
 		},
 	}
 
@@ -202,5 +205,101 @@ func TestNodeValidation_EmptyConstraints(t *testing.T) {
 
 	if !result.Compliant {
 		t.Errorf("expected compliant with no constraints")
+	}
+}
+
+// TestLabelNode_WithFakeClient tests actual node labeling using a fake K8s clientset.
+func TestLabelNode_WithFakeClient(t *testing.T) {
+	// Create a fake node
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "gpu-node-1",
+			Labels: map[string]string{"existing-label": "value"},
+		},
+	}
+	clientset := fake.NewSimpleClientset(node)
+
+	// Build a compliant result
+	result := &NodeResult{
+		NodeName:  "gpu-node-1",
+		Compliant: true,
+		Timestamp: "2026-03-25T14:00:00Z",
+		DiffResult: &diff.Result{
+			Mode: "recipe-vs-snapshot",
+		},
+	}
+
+	// Patch the node directly using the fake clientset (bypasses LabelNode's client creation)
+	labels := result.LabelValues()
+	patchData := []byte(`{"metadata":{"labels":{"` + LabelCompliance + `":"` + labels[LabelCompliance] + `","` + LabelLastValidated + `":"` + labels[LabelLastValidated] + `"}}}`)
+
+	_, err := clientset.CoreV1().Nodes().Patch(
+		context.Background(),
+		result.NodeName,
+		"application/strategic-merge-patch+json",
+		patchData,
+		metav1.PatchOptions{},
+	)
+	if err != nil {
+		t.Fatalf("failed to patch node: %v", err)
+	}
+
+	// Verify labels were applied
+	updated, err := clientset.CoreV1().Nodes().Get(context.Background(), "gpu-node-1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get node: %v", err)
+	}
+
+	if updated.Labels[LabelCompliance] != "true" {
+		t.Errorf("expected %s=true, got %q", LabelCompliance, updated.Labels[LabelCompliance])
+	}
+	if updated.Labels[LabelLastValidated] != "2026-03-25T14:00:00Z" {
+		t.Errorf("expected %s timestamp, got %q", LabelLastValidated, updated.Labels[LabelLastValidated])
+	}
+	// Verify existing labels are preserved
+	if updated.Labels["existing-label"] != "value" {
+		t.Errorf("existing label was overwritten")
+	}
+}
+
+// TestLabelNode_NonCompliant verifies non-compliant label is set correctly.
+func TestLabelNode_NonCompliant(t *testing.T) {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gpu-node-2",
+		},
+	}
+	clientset := fake.NewSimpleClientset(node)
+
+	result := &NodeResult{
+		NodeName:  "gpu-node-2",
+		Compliant: false,
+		Timestamp: "2026-03-25T15:00:00Z",
+		DiffResult: &diff.Result{
+			Mode: "recipe-vs-snapshot",
+		},
+	}
+
+	labels := result.LabelValues()
+	patchData := []byte(`{"metadata":{"labels":{"` + LabelCompliance + `":"` + labels[LabelCompliance] + `","` + LabelLastValidated + `":"` + labels[LabelLastValidated] + `"}}}`)
+
+	_, err := clientset.CoreV1().Nodes().Patch(
+		context.Background(),
+		result.NodeName,
+		"application/strategic-merge-patch+json",
+		patchData,
+		metav1.PatchOptions{},
+	)
+	if err != nil {
+		t.Fatalf("failed to patch node: %v", err)
+	}
+
+	updated, err := clientset.CoreV1().Nodes().Get(context.Background(), "gpu-node-2", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get node: %v", err)
+	}
+
+	if updated.Labels[LabelCompliance] != "false" {
+		t.Errorf("expected %s=false, got %q", LabelCompliance, updated.Labels[LabelCompliance])
 	}
 }

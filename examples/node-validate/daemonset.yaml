@@ -1,0 +1,135 @@
+# Example DaemonSet for continuous per-node recipe compliance validation.
+# Runs aicr node-validate on every GPU node, labels nodes with compliance
+# status, and integrates with Skyhook's workload gate taint.
+#
+# Prerequisites:
+#   - AICR CLI image available (ghcr.io/nvidia/aicr)
+#   - Recipe stored as ConfigMap (aicr-recipe in aicr-validation namespace)
+#   - RBAC: ServiceAccount with node patch permissions (see rbac.yaml)
+#
+# Autoscaler integration flow:
+#   Autoscaler adds node → GPU Operator installs drivers →
+#   Skyhook applies gate taint → node-validate DaemonSet pod starts →
+#   evaluates recipe constraints → labels node with compliance status →
+#   if compliant: Skyhook removes gate taint → KAI schedules workloads
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aicr-node-validate
+  namespace: aicr-validation
+  labels:
+    app.kubernetes.io/name: aicr
+    app.kubernetes.io/component: node-validate
+    app.kubernetes.io/managed-by: aicr
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aicr
+      app.kubernetes.io/component: node-validate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aicr
+        app.kubernetes.io/component: node-validate
+    spec:
+      serviceAccountName: aicr-node-validate
+      # Run on GPU nodes only
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      # Tolerate Skyhook's workload gate taint so we can validate
+      # nodes before the taint is removed
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: node-validate
+          image: ghcr.io/nvidia/aicr:latest
+          command:
+            - aicr
+            - node-validate
+            - --recipe
+            - /etc/aicr/recipe.yaml
+            - --label-node
+            - --fail-on-drift
+            - --format
+            - json
+          env:
+            # Node name via Downward API (used by collectors)
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: recipe
+              mountPath: /etc/aicr
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          # Re-validate every 5 minutes
+          # In production, use a CronJob or adjust the liveness probe interval
+          livenessProbe:
+            exec:
+              command:
+                - aicr
+                - node-validate
+                - --recipe
+                - /etc/aicr/recipe.yaml
+                - --format
+                - json
+            initialDelaySeconds: 30
+            periodSeconds: 300
+      volumes:
+        - name: recipe
+          configMap:
+            name: aicr-recipe
+---
+# RBAC for node-validate DaemonSet
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aicr-node-validate
+  namespace: aicr-validation
+  labels:
+    app.kubernetes.io/name: aicr
+    app.kubernetes.io/component: node-validate
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aicr-node-validate
+  labels:
+    app.kubernetes.io/name: aicr
+    app.kubernetes.io/component: node-validate
+rules:
+  # Node labeling (--label-node)
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "patch"]
+  # Snapshot collection (K8s collector)
+  - apiGroups: [""]
+    resources: ["pods", "namespaces", "configmaps"]
+    verbs: ["get", "list"]
+  # ClusterPolicy collection (policy collector)
+  - apiGroups: ["*"]
+    resources: ["clusterpolicies"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aicr-node-validate
+  labels:
+    app.kubernetes.io/name: aicr
+    app.kubernetes.io/component: node-validate
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aicr-node-validate
+subjects:
+  - kind: ServiceAccount
+    name: aicr-node-validate
+    namespace: aicr-validation

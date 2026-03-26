@@ -20,9 +20,9 @@ package nodevalidate
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
 	"sync"
 	"time"
 
@@ -33,8 +33,11 @@ import (
 	"github.com/NVIDIA/aicr/pkg/diff"
 	"github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/NVIDIA/aicr/pkg/header"
+	k8sclient "github.com/NVIDIA/aicr/pkg/k8s/client"
 	"github.com/NVIDIA/aicr/pkg/recipe"
 	"github.com/NVIDIA/aicr/pkg/snapshotter"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
@@ -85,8 +88,8 @@ func ValidateNode(ctx context.Context, rec *recipe.RecipeResult, cfg Config) (*N
 		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to collect local snapshot", err)
 	}
 
-	// Evaluate recipe constraints against local snapshot
-	// This is the same code path as `aicr diff --recipe` and validator.checkReadiness
+	// Evaluate recipe constraints against local snapshot.
+	// This is the same code path as `aicr diff --recipe` and validator.checkReadiness.
 	result := diff.RecipeVsSnapshot(rec, snap)
 	result.BaselineSource = "recipe"
 	result.TargetSource = fmt.Sprintf("node:%s", nodeName)
@@ -106,6 +109,50 @@ func ValidateNode(ctx context.Context, rec *recipe.RecipeResult, cfg Config) (*N
 		slog.Duration("duration", time.Since(start)))
 
 	return nodeResult, nil
+}
+
+// LabelNode applies compliance labels to the node via Kubernetes API.
+// Requires RBAC permission to patch nodes (verb: patch, resource: nodes).
+func LabelNode(ctx context.Context, kubeconfig string, result *NodeResult) error {
+	if result.NodeName == "" {
+		return errors.New(errors.ErrCodeInvalidRequest, "node name is empty — cannot label")
+	}
+
+	clientset, _, err := k8sclient.GetKubeClientWithConfig(kubeconfig)
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to create kubernetes client", err)
+	}
+
+	labels := result.LabelValues()
+
+	// Build strategic merge patch for labels
+	patch := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"labels": labels,
+		},
+	}
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to marshal label patch", err)
+	}
+
+	_, err = clientset.CoreV1().Nodes().Patch(
+		ctx,
+		result.NodeName,
+		types.StrategicMergePatchType,
+		patchBytes,
+		metav1.PatchOptions{},
+	)
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInternal,
+			fmt.Sprintf("failed to patch node %q labels", result.NodeName), err)
+	}
+
+	slog.Info("node labels applied",
+		slog.String("node", result.NodeName),
+		slog.String(LabelCompliance, labels[LabelCompliance]))
+
+	return nil
 }
 
 // collectLocalSnapshot runs collectors locally (same pattern as NodeSnapshotter.measure)
@@ -150,21 +197,6 @@ func collectLocalSnapshot(ctx context.Context, nodeName string, cfg Config) (*sn
 	return snap, nil
 }
 
-// GetNodeName returns the current node name from environment variables.
-// Priority: NODE_NAME > KUBERNETES_NODE_NAME > HOSTNAME > os.Hostname()
-func GetNodeName() string {
-	for _, env := range []string{"NODE_NAME", "KUBERNETES_NODE_NAME", "HOSTNAME"} {
-		if v := os.Getenv(env); v != "" {
-			return v
-		}
-	}
-	hostname, err := os.Hostname()
-	if err != nil {
-		return "unknown"
-	}
-	return hostname
-}
-
 // LabelValues returns the node labels that should be applied based on the validation result.
 func (r *NodeResult) LabelValues() map[string]string {
 	compliant := "false"
@@ -198,4 +230,3 @@ func (r *NodeResult) ErrorConstraints() []diff.ConstraintResult {
 	}
 	return errs
 }
-

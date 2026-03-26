@@ -18,9 +18,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 
 	"github.com/urfave/cli/v3"
 
+	"github.com/NVIDIA/aicr/pkg/diff"
 	"github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/NVIDIA/aicr/pkg/nodevalidate"
 	"github.com/NVIDIA/aicr/pkg/recipe"
@@ -42,7 +44,8 @@ GPU, OS, kernel, and K8s node state, then evaluate recipe
 constraints against the collected data.
 
 Use --label-node to set the aicr.nvidia.com/recipe-compliant label
-on the node based on the validation result.
+on the node based on the validation result. Requires RBAC permission
+to patch nodes.
 
 Examples:
   # Validate this node against a recipe
@@ -123,14 +126,14 @@ func runNodeValidateCmd(ctx context.Context, cmd *cli.Command) error {
 
 	// Label node if requested
 	if cmd.Bool("label-node") {
-		if labelErr := labelNode(ctx, kubeconfig, result); labelErr != nil {
-			slog.Warn("failed to label node", slog.String("error", labelErr.Error()))
-			// Non-fatal — continue with output
+		if labelErr := nodevalidate.LabelNode(ctx, kubeconfig, result); labelErr != nil {
+			slog.Warn("failed to label node — continuing with output",
+				slog.String("error", labelErr.Error()))
 		}
 	}
 
 	// Write output
-	if err := writeNodeResult(ctx, cmd, outFormat, result); err != nil {
+	if err := writeNodeValidateResult(ctx, cmd, outFormat, result); err != nil {
 		return err
 	}
 
@@ -146,40 +149,32 @@ func runNodeValidateCmd(ctx context.Context, cmd *cli.Command) error {
 	return nil
 }
 
-// labelNode applies compliance labels to the current node via K8s API.
-func labelNode(ctx context.Context, kubeconfig string, result *nodevalidate.NodeResult) error {
-	// Import here to avoid pulling K8s client dependencies when --label-node is not used
-	k8sClient, _, err := getKubeClient(kubeconfig)
-	if err != nil {
-		return errors.Wrap(errors.ErrCodeInternal, "failed to create kubernetes client for node labeling", err)
-	}
-
-	labels := result.LabelValues()
-	return patchNodeLabels(ctx, k8sClient, result.NodeName, labels)
-}
-
-// getKubeClient returns a kubernetes clientset, with optional kubeconfig override.
-func getKubeClient(kubeconfig string) (interface{}, interface{}, error) {
-	// Placeholder — actual implementation uses pkg/k8s/client
-	// This will be connected when running in-cluster with proper RBAC
-	return nil, nil, errors.New(errors.ErrCodeInternal, "node labeling requires in-cluster execution with node patch RBAC")
-}
-
-// patchNodeLabels applies labels to a node via strategic merge patch.
-func patchNodeLabels(_ context.Context, _ interface{}, _ string, _ map[string]string) error {
-	// Placeholder — actual implementation uses clientset.CoreV1().Nodes().Patch()
-	return errors.New(errors.ErrCodeInternal, "node labeling requires in-cluster execution with node patch RBAC")
-}
-
-// writeNodeResult serializes the node validation result.
-func writeNodeResult(ctx context.Context, cmd *cli.Command, outFormat serializer.Format, result *nodevalidate.NodeResult) error {
+// writeNodeValidateResult serializes the node validation result.
+func writeNodeValidateResult(ctx context.Context, cmd *cli.Command, outFormat serializer.Format, result *nodevalidate.NodeResult) error {
 	output := cmd.String("output")
 
-	// Table output uses the diff table writer
+	// Table output uses the diff table writer for the constraint/component detail
 	if outFormat == serializer.FormatTable {
-		return writeDiffResult(ctx, cmd, outFormat, result.DiffResult)
+		w := os.Stdout
+		if output != "" {
+			f, err := os.Create(output)
+			if err != nil {
+				return errors.Wrap(errors.ErrCodeInternal, "failed to create output file", err)
+			}
+			defer f.Close()
+			w = f
+		}
+		fmt.Fprintf(w, "NODE: %s\n", result.NodeName)
+		if result.Compliant {
+			fmt.Fprintln(w, "STATUS: COMPLIANT")
+		} else {
+			fmt.Fprintln(w, "STATUS: NON-COMPLIANT")
+		}
+		fmt.Fprintf(w, "TIMESTAMP: %s\n\n", result.Timestamp)
+		return diff.WriteTable(w, result.DiffResult)
 	}
 
+	// JSON/YAML use standard serializer
 	ser, err := serializer.NewFileWriterOrStdout(outFormat, output)
 	if err != nil {
 		return errors.Wrap(errors.ErrCodeInternal, "failed to create output writer", err)
