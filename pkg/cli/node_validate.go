@@ -18,8 +18,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/urfave/cli/v3"
 
 	"github.com/NVIDIA/aicr/pkg/diff"
@@ -89,6 +91,11 @@ func nodeValidateCmdFlags() []cli.Flag {
 			Usage:    "run continuously at this interval (e.g., 5m, 1h). Without this flag, runs once and exits.",
 			Category: "Node",
 		},
+		&cli.IntFlag{
+			Name:     "metrics-port",
+			Usage:    "expose Prometheus /metrics endpoint on this port (used with --interval for DaemonSet mode)",
+			Category: "Node",
+		},
 		&cli.BoolFlag{
 			Name:     "fail-on-drift",
 			Usage:    "exit with non-zero status if node is non-compliant (one-shot mode only)",
@@ -139,6 +146,22 @@ func runNodeValidateCmd(ctx context.Context, cmd *cli.Command) error {
 				return csErr
 			}
 			clientset = cs
+		}
+
+		// Start Prometheus metrics server if --metrics-port is set
+		if metricsPort := cmd.Int("metrics-port"); metricsPort > 0 {
+			mux := http.NewServeMux()
+			mux.Handle("/metrics", promhttp.Handler())
+			mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})
+			addr := fmt.Sprintf(":%d", metricsPort)
+			go func() {
+				slog.Info("starting metrics server", slog.String("addr", addr))
+				if srvErr := http.ListenAndServe(addr, mux); srvErr != nil && srvErr != http.ErrServerClosed { //nolint:gosec // Metrics server is internal, no TLS needed
+					slog.Error("metrics server failed", slog.String("error", srvErr.Error()))
+				}
+			}()
 		}
 
 		return nodevalidate.RunLoop(ctx, rec, cfg, interval, clientset)

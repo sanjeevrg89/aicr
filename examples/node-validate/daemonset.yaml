@@ -80,8 +80,14 @@ spec:
             - --label-node
             - --interval
             - "5m"
+            - --metrics-port
+            - "9090"
             - --format
             - json
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
           env:
             # Node name via Downward API (required by collectors)
             - name: NODE_NAME
@@ -149,3 +155,43 @@ subjects:
   - kind: ServiceAccount
     name: aicr-node-validate
     namespace: aicr-validation
+---
+# Service for Prometheus to discover node-validate pods
+apiVersion: v1
+kind: Service
+metadata:
+  name: aicr-node-validate-metrics
+  namespace: aicr-validation
+  labels:
+    app.kubernetes.io/name: aicr
+    app.kubernetes.io/component: node-validate
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: aicr
+    app.kubernetes.io/component: node-validate
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+---
+# ServiceMonitor for Prometheus auto-discovery.
+# kube-prometheus-stack is configured with serviceMonitorSelectorNilUsesHelmValues: false
+# which means it discovers ServiceMonitors across all namespaces.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: aicr-node-validate
+  namespace: aicr-validation
+  labels:
+    app.kubernetes.io/name: aicr
+    app.kubernetes.io/component: node-validate
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aicr
+      app.kubernetes.io/component: node-validate
+  endpoints:
+    - port: metrics
+      interval: 60s
+      path: /metrics

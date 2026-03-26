@@ -101,12 +101,17 @@ func ValidateNode(ctx context.Context, rec *recipe.RecipeResult, cfg Config) (*N
 		DiffResult: result,
 	}
 
+	duration := time.Since(start)
+
 	slog.Info("node validation complete",
 		slog.String("node", nodeName),
 		slog.Bool("compliant", nodeResult.Compliant),
 		slog.Int("constraintsPassed", result.Summary.ConstraintsPassed),
 		slog.Int("constraintsFailed", result.Summary.ConstraintsFailed),
-		slog.Duration("duration", time.Since(start)))
+		slog.Duration("duration", duration))
+
+	// Record Prometheus metrics
+	RecordNodeMetrics(nodeResult, duration.Seconds())
 
 	return nodeResult, nil
 }
