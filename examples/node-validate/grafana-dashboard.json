@@ -179,13 +179,17 @@
       ]
     },
     {
-      "title": "Node Validation Duration (p99)",
+      "title": "Fleet Validation Duration (p99)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
       "targets": [
         {
           "expr": "histogram_quantile(0.99, rate(aicr_node_validation_duration_seconds_bucket[5m]))",
-          "legendFormat": "{{node}} p99"
+          "legendFormat": "fleet p99"
+        },
+        {
+          "expr": "histogram_quantile(0.5, rate(aicr_node_validation_duration_seconds_bucket[5m]))",
+          "legendFormat": "fleet p50"
         }
       ],
       "fieldConfig": {
@@ -195,13 +199,13 @@
       }
     },
     {
-      "title": "Node Constraint Failures Over Time",
+      "title": "Fleet Constraint Failure Rate",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
       "targets": [
         {
-          "expr": "aicr_node_constraints_failed",
-          "legendFormat": "{{node}}"
+          "expr": "rate(aicr_node_constraints_failed_total[5m])",
+          "legendFormat": "failures/sec"
         }
       ],
       "fieldConfig": {
@@ -209,11 +213,24 @@
           "thresholds": {
             "steps": [
               { "color": "green", "value": null },
-              { "color": "red", "value": 1 }
+              { "color": "red", "value": 0.1 }
             ]
           }
         }
       }
+    },
+    {
+      "title": "Non-Compliant Nodes (drill-down via aicr_node_compliant{node})",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 28 },
+      "targets": [
+        {
+          "expr": "aicr_node_compliant == 0",
+          "legendFormat": "{{node}}",
+          "instant": true
+        }
+      ],
+      "description": "The aicr_node_compliant gauge is the only metric carrying a {node} label (bounded by fleet size). Counters and histograms are fleet-aggregated for federation safety. For per-constraint detail, see the rate-limited Kubernetes Events with reason=RecipeNonCompliant."
     }
   ],
   "schemaVersion": 39,

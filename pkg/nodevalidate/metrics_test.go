@@ -30,6 +30,15 @@ func gaugeVal(t *testing.T, g interface{ Write(*dto.Metric) error }) float64 {
 	return m.GetGauge().GetValue()
 }
 
+func counterVal(t *testing.T, c interface{ Write(*dto.Metric) error }) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatalf("failed to read counter: %v", err)
+	}
+	return m.GetCounter().GetValue()
+}
+
 func TestRecordNodeMetrics_Compliant(t *testing.T) {
 	result := &NodeResult{
 		NodeName:  "metrics-node-1",
@@ -45,11 +54,9 @@ func TestRecordNodeMetrics_Compliant(t *testing.T) {
 	if v := gaugeVal(t, nodeCompliant.WithLabelValues("metrics-node-1")); v != 1 {
 		t.Errorf("expected compliant=1, got %f", v)
 	}
-	if v := gaugeVal(t, nodeConstraintsPassed.WithLabelValues("metrics-node-1")); v != 3 {
-		t.Errorf("expected 3 passed, got %f", v)
-	}
-	if v := gaugeVal(t, nodeConstraintsFailed.WithLabelValues("metrics-node-1")); v != 0 {
-		t.Errorf("expected 0 failed, got %f", v)
+	// Counter for compliant result should have been incremented at least once.
+	if v := counterVal(t, nodeValidationTotal.WithLabelValues("compliant")); v < 1 {
+		t.Errorf("expected nodeValidationTotal{result=compliant} >= 1, got %f", v)
 	}
 }
 
@@ -63,12 +70,18 @@ func TestRecordNodeMetrics_NonCompliant(t *testing.T) {
 		},
 	}
 
+	before := counterVal(t, nodeValidationTotal.WithLabelValues("non-compliant"))
+	beforeFailed := counterVal(t, nodeConstraintsFailedTotal)
+
 	RecordNodeMetrics(result, 2.0)
 
 	if v := gaugeVal(t, nodeCompliant.WithLabelValues("metrics-node-2")); v != 0 {
 		t.Errorf("expected compliant=0, got %f", v)
 	}
-	if v := gaugeVal(t, nodeConstraintsFailed.WithLabelValues("metrics-node-2")); v != 2 {
-		t.Errorf("expected 2 failed, got %f", v)
+	if got := counterVal(t, nodeValidationTotal.WithLabelValues("non-compliant")); got != before+1 {
+		t.Errorf("expected nodeValidationTotal{result=non-compliant} to increment by 1, before=%f after=%f", before, got)
+	}
+	if got := counterVal(t, nodeConstraintsFailedTotal); got != beforeFailed+2 {
+		t.Errorf("expected nodeConstraintsFailedTotal to increment by 2, before=%f after=%f", beforeFailed, got)
 	}
 }

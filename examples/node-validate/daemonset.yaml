@@ -82,6 +82,8 @@ spec:
             - "5m"
             - --metrics-port
             - "9090"
+            - --event-namespace
+            - aicr-validation
             - --format
             - json
           ports:
@@ -151,6 +153,39 @@ rules:
   - apiGroups: ["nvidia.com"]
     resources: ["clusterpolicies"]
     verbs: ["get", "list"]
+---
+# Event emission (--event-namespace). Scoped to the aicr-validation namespace
+# only; the DaemonSet never writes events elsewhere. Rate-limited to at most
+# one event per (node, reason) per 5 minutes by the node-validate process.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aicr-node-validate-events
+  namespace: aicr-validation
+  labels:
+    app.kubernetes.io/name: aicr
+    app.kubernetes.io/component: node-validate
+rules:
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aicr-node-validate-events
+  namespace: aicr-validation
+  labels:
+    app.kubernetes.io/name: aicr
+    app.kubernetes.io/component: node-validate
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: aicr-node-validate-events
+subjects:
+  - kind: ServiceAccount
+    name: aicr-node-validate
+    namespace: aicr-validation
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
