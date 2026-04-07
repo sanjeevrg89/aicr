@@ -96,6 +96,11 @@ func nodeValidateCmdFlags() []cli.Flag {
 			Usage:    "expose Prometheus /metrics endpoint on this port (used with --interval for DaemonSet mode)",
 			Category: "Node",
 		},
+		&cli.StringFlag{
+			Name:     "event-namespace",
+			Usage:    "emit rate-limited Kubernetes Events on non-compliance in this namespace (requires events create RBAC). Empty disables events.",
+			Category: "Node",
+		},
 		&cli.BoolFlag{
 			Name:     "fail-on-drift",
 			Usage:    "exit with non-zero status if node is non-compliant (one-shot mode only)",
@@ -164,7 +169,8 @@ func runNodeValidateCmd(ctx context.Context, cmd *cli.Command) error {
 			}()
 		}
 
-		return nodevalidate.RunLoop(ctx, rec, cfg, interval, clientset)
+		eventNamespace := cmd.String("event-namespace")
+		return nodevalidate.RunLoop(ctx, rec, cfg, interval, clientset, eventNamespace)
 	}
 
 	// One-shot mode: validate once and exit

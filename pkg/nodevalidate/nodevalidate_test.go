@@ -330,12 +330,15 @@ func (f *mockFactory) CreateNodeTopologyCollector() collector.Collector {
 	return &mockCollector{mtype: measurement.TypeNodeTopology, subtype: "labels", data: map[string]measurement.Reading{}}
 }
 
-// TestValidateNode_WithMockFactory exercises ValidateNode end-to-end
-// with injected mock collectors — no real system access.
+// TestValidateNode_WithMockFactory exercises ValidateNode end-to-end with
+// injected mock collectors. The recipe mixes cluster-scoped and node-scoped
+// constraints; ValidateNode must filter out the cluster-scoped ones since a
+// node cannot answer K8s.server.version from its local snapshot.
+// See docs/design/005-node-scoped-constraints.md.
 func TestValidateNode_WithMockFactory(t *testing.T) {
 	rec := &recipe.RecipeResult{
 		Constraints: []recipe.Constraint{
-			{Name: "K8s.server.version", Value: ">= 1.32", Severity: "error"},
+			{Name: "K8s.server.version", Value: ">= 1.32", Severity: "error"}, // cluster, filtered
 			{Name: "GPU.device.driver", Value: ">= 535.0", Severity: "warning"},
 			{Name: "OS.release.ID", Value: "ubuntu", Severity: "error"},
 		},
@@ -363,24 +366,32 @@ func TestValidateNode_WithMockFactory(t *testing.T) {
 	if result.NodeName != "mock-gpu-node" {
 		t.Errorf("expected node name mock-gpu-node, got %s", result.NodeName)
 	}
-	if result.DiffResult.Summary.ConstraintsPassed != 3 {
-		t.Errorf("expected 3 passed constraints, got %d", result.DiffResult.Summary.ConstraintsPassed)
+	// K8s.server.version is cluster-scoped and must be filtered out.
+	// Only the 2 node-scoped constraints should be evaluated.
+	if result.DiffResult.Summary.ConstraintsPassed != 2 {
+		t.Errorf("expected 2 passed constraints (K8s filtered out), got %d",
+			result.DiffResult.Summary.ConstraintsPassed)
+	}
+	if result.DiffResult.Summary.Total != 2 {
+		t.Errorf("expected 2 total constraints evaluated, got %d",
+			result.DiffResult.Summary.Total)
 	}
 }
 
-// TestValidateNode_NonCompliantWithMock exercises ValidateNode with a failing constraint.
+// TestValidateNode_NonCompliantWithMock exercises ValidateNode with a failing
+// node-scoped constraint (GPU driver too old).
 func TestValidateNode_NonCompliantWithMock(t *testing.T) {
 	rec := &recipe.RecipeResult{
 		Constraints: []recipe.Constraint{
-			{Name: "K8s.server.version", Value: ">= 1.32", Severity: "error", Remediation: "Upgrade K8s"},
+			{Name: "GPU.device.driver", Value: ">= 550.0", Severity: "error", Remediation: "Upgrade driver"},
 		},
 	}
 
 	cfg := Config{
 		Version: "test",
 		Factory: &mockFactory{
-			k8s: map[string]measurement.Reading{"version": measurement.Str("1.31.0")},
-			gpu: map[string]measurement.Reading{},
+			k8s: map[string]measurement.Reading{},
+			gpu: map[string]measurement.Reading{"driver": measurement.Str("535.54.03")},
 			osR: map[string]measurement.Reading{},
 		},
 	}
@@ -397,6 +408,43 @@ func TestValidateNode_NonCompliantWithMock(t *testing.T) {
 	}
 	if len(result.FailedConstraints()) != 1 {
 		t.Errorf("expected 1 failed constraint, got %d", len(result.FailedConstraints()))
+	}
+}
+
+// TestValidateNode_ClusterOnlyRecipe verifies that a recipe containing only
+// cluster-scoped constraints produces a compliant result on every node (there
+// is nothing node-local to evaluate). This is the contract documented in
+// docs/design/005-node-scoped-constraints.md: "compliant" means all
+// node-scoped constraints passed.
+func TestValidateNode_ClusterOnlyRecipe(t *testing.T) {
+	rec := &recipe.RecipeResult{
+		Constraints: []recipe.Constraint{
+			{Name: "K8s.server.version", Value: ">= 1.32", Severity: "error"},
+		},
+	}
+
+	cfg := Config{
+		Version: "test",
+		Factory: &mockFactory{
+			k8s: map[string]measurement.Reading{"version": measurement.Str("1.30.0")}, // would fail if evaluated
+			gpu: map[string]measurement.Reading{"driver": measurement.Str("550.0")},
+			osR: map[string]measurement.Reading{"ID": measurement.Str("ubuntu")},
+		},
+	}
+
+	t.Setenv("NODE_NAME", "mock-gpu-node")
+
+	result, err := ValidateNode(context.Background(), rec, cfg)
+	if err != nil {
+		t.Fatalf("ValidateNode failed: %v", err)
+	}
+
+	if !result.Compliant {
+		t.Errorf("expected compliant (cluster-scoped constraints must be filtered out)")
+	}
+	if result.DiffResult.Summary.Total != 0 {
+		t.Errorf("expected 0 constraints evaluated (all cluster-scoped), got %d",
+			result.DiffResult.Summary.Total)
 	}
 }
 
@@ -418,7 +466,7 @@ func TestRunLoop_Cancellation(t *testing.T) {
 
 	t.Setenv("NODE_NAME", "mock-node")
 
-	err := RunLoop(ctx, rec, cfg, 1*time.Second, nil)
+	err := RunLoop(ctx, rec, cfg, 1*time.Second, nil, "")
 	if err != nil {
 		t.Errorf("expected nil error on cancellation, got: %v", err)
 	}

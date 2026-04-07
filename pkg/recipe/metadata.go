@@ -59,6 +59,13 @@ type Constraint struct {
 
 	// Unit specifies the unit for numeric constraints (e.g., "GB/s").
 	Unit string `json:"unit,omitempty" yaml:"unit,omitempty"`
+
+	// Scope overrides the default scope classification for this constraint.
+	// When empty, the scope is inferred from the constraint's measurement type
+	// (see measurement.Type.DefaultScope).
+	// Valid values: "node", "cluster".
+	// See docs/design/005-node-scoped-constraints.md.
+	Scope string `json:"scope,omitempty" yaml:"scope,omitempty"`
 }
 
 // ComponentRef represents a reference to a deployable component.

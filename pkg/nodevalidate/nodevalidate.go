@@ -34,6 +34,7 @@ import (
 	"github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/NVIDIA/aicr/pkg/header"
 	k8sclient "github.com/NVIDIA/aicr/pkg/k8s/client"
+	"github.com/NVIDIA/aicr/pkg/measurement"
 	"github.com/NVIDIA/aicr/pkg/recipe"
 	"github.com/NVIDIA/aicr/pkg/snapshotter"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -88,10 +89,17 @@ func ValidateNode(ctx context.Context, rec *recipe.RecipeResult, cfg Config) (*N
 		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to collect local snapshot", err)
 	}
 
-	// Evaluate recipe constraints against local snapshot.
-	// This is the same code path as `aicr diff --recipe` and validator.checkReadiness.
-	result := diff.RecipeVsSnapshot(rec, snap)
-	result.BaselineSource = "recipe"
+	// Filter to node-scoped constraints only. A node cannot answer
+	// cluster-scoped constraints like K8s.server.version; evaluating them
+	// against a node-local snapshot would produce spurious failures.
+	// See docs/design/005-node-scoped-constraints.md.
+	nodeScoped := rec.ScopedView(measurement.ScopeNode)
+
+	// Evaluate node-scoped recipe constraints against local snapshot.
+	// Same code path as `aicr diff --recipe` and validator.checkReadiness,
+	// just over a filtered constraint set.
+	result := diff.RecipeVsSnapshot(nodeScoped, snap)
+	result.BaselineSource = "recipe (node-scoped constraints only)"
 	result.TargetSource = fmt.Sprintf("node:%s", nodeName)
 
 	nodeResult := &NodeResult{
@@ -156,21 +164,39 @@ func LabelNode(ctx context.Context, clientset k8sclient.Interface, result *NodeR
 	return nil
 }
 
-// RunLoop runs node validation repeatedly at the given interval until the context
-// is cancelled. Designed for DaemonSet execution where the container must stay alive.
-// On each iteration it validates, labels the node, and sleeps for the interval.
-func RunLoop(ctx context.Context, rec *recipe.RecipeResult, cfg Config, interval time.Duration, clientset k8sclient.Interface) error {
+// RunLoop runs node validation repeatedly at the given interval until the
+// context is cancelled. Designed for DaemonSet execution where the container
+// must stay alive. On each iteration it validates, labels the node, emits a
+// rate-limited K8s Event on non-compliance, and sleeps for the interval.
+//
+// eventNamespace is the namespace where compliance Events are created. If
+// empty, event emission is skipped. Typical value is the DaemonSet's own
+// namespace.
+func RunLoop(
+	ctx context.Context,
+	rec *recipe.RecipeResult,
+	cfg Config,
+	interval time.Duration,
+	clientset k8sclient.Interface,
+	eventNamespace string,
+) error {
 	slog.Info("starting node-validate loop", slog.Duration("interval", interval))
 
 	for {
 		result, err := ValidateNode(ctx, rec, cfg)
 		if err != nil {
 			slog.Error("validation iteration failed", slog.String("error", err.Error()))
-			nodeName := k8s.GetNodeName()
-			nodeValidationTotal.WithLabelValues(nodeName, "error").Inc()
+			nodeValidationTotal.WithLabelValues("error").Inc()
 		} else if clientset != nil {
 			if labelErr := LabelNode(ctx, clientset, result); labelErr != nil {
 				slog.Warn("failed to label node", slog.String("error", labelErr.Error()))
+			}
+			if eventNamespace != "" && !result.Compliant {
+				if evtErr := EmitFailureEvent(ctx, clientset, eventNamespace, result); evtErr != nil {
+					// Events are complementary; never fail the loop on
+					// event emission errors (e.g., RBAC gaps).
+					slog.Warn("failed to emit non-compliance event", slog.String("error", evtErr.Error()))
+				}
 			}
 		}
 
